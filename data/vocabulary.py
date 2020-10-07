@@ -83,10 +83,10 @@ class Vocabulary(object):
     def _init_dict(self):
 
         return {
-            "<PAD>": (self.PAD, 0),
-            "<UNK>": (self.UNK, 0),
-            "<EOS>": (self.EOS, 0),
-            "<BOS>": (self.BOS, 0)
+            "<pad>": (self.PAD, 0),
+            "</s>": (self.EOS, 0),
+            "<s>": (self.BOS, 0),
+            "<unk>": (self.UNK, 0)
         }
 
     def _load_vocab(self, path):
@@ -118,7 +118,6 @@ class Vocabulary(object):
                     self._token2id_feq[ww] = (i + N, 0)
 
     def word2id(self, word):
-
         if word in self._token2id_feq and self._token2id_feq[word][0] < self.max_n_words:
             return self._token2id_feq[word][0]
         else:

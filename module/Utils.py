@@ -8,7 +8,6 @@ import sys
 import os
 
 
-
 _FLOAT32_INF = np.float32(np.finfo('float32').max / 10)
 
 
@@ -174,22 +173,24 @@ def tile_batch(x, multiplier, batch_dim=0):
 
     return x_tiled
 
-def mask_scores(scores, beam_mask):
-
+def mask_scores(scores, beam_mask, eos_id):
     """
-    :type scores: Variable
-    :param scores: [B, Bm, N]
+    Mask scores of next step according to beam mask.
+    Args:
+        scores (torch.Tensor): Scores of next tokens with shape [batch_size, beam_size, vocab_size].
+            Smaller should be better (usually negative log-probs).
+        beam_mask (torch.Tensor): Mask of beam. 1.0 means not closed and vice verse. The shape is
+            [batch_size, beam_size]
 
-    :type beam_mask: Variable
-    :param beam_mask: [B, Bm]
+    Returns:
+        Masked scores of next tokens.
     """
-
     vocab_size = scores.size(-1)
 
     finished_row = beam_mask.new(vocab_size, ).zero_() + float(_FLOAT32_INF)
 
     # If beam finished, only PAD could be generated afterwards.
-    finished_row[NMTVocab.EOS] = 0.0
+    finished_row[eos_id] = 0.0
 
     scores = scores * beam_mask.unsqueeze(2) + \
              torch.matmul((1.0 - beam_mask).unsqueeze(2), finished_row.unsqueeze(0))
@@ -385,11 +386,16 @@ class Statistics(object):
     def elapsed_time(self):
         return time.time() - self.start_time
 
-    def print_out(self, step, epoch, batch, n_batches):
+    def print_out(self, step, epoch, batch, n_batches, lr, batch_size, best_bleu):
         t = self.elapsed_time()
-        out_info = ("Step %d, Epoch %d, %d/%d| acc: %.2f| ppl: %.2f| %.1f tgt tok/s| %.2f s elapsed") \
-                   % (step, epoch, batch, n_batches,self.accuracy(), self.ppl(), \
+
+        out_info = ("Step %d, Epoch %d, %d/%d| lr: %.6f| words: %d| "
+                    "acc: %.2f| ppl: %.2f| %.1f tgt tok/s| %.2f s elapsed | best bleu is: ") \
+                   % (step, epoch, batch, n_batches, lr, int(batch_size), self.accuracy(), self.ppl(), \
                     self.n_words / (t + 1e-5), time.time() - self.start_time)
+        # for i in range(len(best_bleu)):
+        #     out_info += '%.2f, ' % best_bleu[i]
+        out_info += '%.2f' % best_bleu
         print(out_info)
         sys.stdout.flush()
 

@@ -1,10 +1,12 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 from torch.autograd import Variable
 from module.Basic import BottleLinear as Linear
 from module.Sublayers import PositionwiseFeedForward, MultiHeadedAttention
 from module.Embeddings import Embeddings
+from data.vocabulary import Vocabulary
 from module.Utils import *
 from module import Init
 from data.Vocab import NMTVocab
@@ -46,16 +48,17 @@ class EncoderBlock(nn.Module):
 
 class Encoder(nn.Module):
     def __init__(
-            self, n_src_vocab, n_layers=6, n_head=8,
+            self, src_vocab, n_layers=6, n_head=8,
             d_word_vec=512, d_model=512, d_inner_hid=1024, dropout=0.1):
 
         super().__init__()
 
+        self.src_vocab = src_vocab
         self.d_word_vec = d_word_vec
         self.d_model = d_model
 
         self.num_layers = n_layers
-        self.embeddings = Embeddings(num_embeddings=n_src_vocab,
+        self.embeddings = Embeddings(num_embeddings=src_vocab.max_n_words,
                                      embedding_dim=d_word_vec,
                                      dropout=dropout,
                                      add_position_embedding=True
@@ -94,8 +97,8 @@ class Encoder(nn.Module):
         batch_size, src_len = src_seq.size()
 
         emb = self.get_embeddings(src_seq)
-
-        enc_mask = src_seq.data.eq(NMTVocab.PAD)
+        
+        enc_mask = src_seq.data.eq(self.src_vocab.PAD)
         enc_slf_attn_mask = enc_mask.unsqueeze(1).expand(batch_size, src_len, src_len)
 
         out = emb
@@ -151,17 +154,19 @@ class DecoderBlock(nn.Module):
 class Decoder(nn.Module):
     ''' A decoder model with self attention mechanism. '''
     def __init__(
-            self, n_tgt_vocab, n_layers=6, n_head=8,
+            self, tgt_vocab, n_layers=6, n_head=8,
             d_word_vec=512, d_model=512, d_inner_hid=1024, dropout=0.1):
 
         super(Decoder, self).__init__()
+
+        self.tgt_vocab = tgt_vocab
 
         self.n_head = n_head
         self.num_layers = n_layers
         self.d_model = d_model
         self.d_word_vec = d_word_vec
 
-        self.embeddings = Embeddings(n_tgt_vocab, d_word_vec,
+        self.embeddings = Embeddings(tgt_vocab.max_n_words, d_word_vec,
                                        dropout=dropout, add_position_embedding=True)
 
         self.block_stack = nn.ModuleList([
@@ -212,7 +217,7 @@ class Decoder(nn.Module):
             query_len = 1
 
         # Decode mask
-        dec_slf_attn_pad_mask = tgt_seq.detach().eq(NMTVocab.PAD).unsqueeze(1).expand(batch_size, query_len, key_len)
+        dec_slf_attn_pad_mask = tgt_seq.detach().eq(self.tgt_vocab.PAD).unsqueeze(1).expand(batch_size, query_len, key_len)
         dec_slf_attn_sub_mask = get_attn_causal_mask(emb)
 
         dec_slf_attn_mask = torch.gt(dec_slf_attn_pad_mask + dec_slf_attn_sub_mask, 0)
@@ -239,55 +244,87 @@ class Decoder(nn.Module):
 
 class Generator(nn.Module):
 
-    def __init__(self, n_words, hidden_size, shared_weight=None, padding_idx=-1):
-
+    def __init__(self, vocab, hidden_size, shared_weight=None):
         super(Generator, self).__init__()
 
-        self.n_words = n_words
+        self.pad = vocab.pad()
+        self.n_words = vocab.max_n_words
+
         self.hidden_size = hidden_size
-        self.padding_idx = padding_idx
 
         self.proj = Linear(self.hidden_size, self.n_words, bias=False)
-        self.actn = nn.LogSoftmax(dim=-1)
 
         if shared_weight is not None:
             self.proj.linear.weight = shared_weight
 
+    def _pad_2d(self, x):
 
-    def forward(self, input):
+        if self.pad == -1:
+            return x
+        else:
+            x_size = x.size()
+            x_2d = x.view(-1, x.size(-1))
+
+            mask = x_2d.new(1, x_2d.size(-1)).zero_()
+            mask[0][self.pad] = float('-inf')
+            x_2d = x_2d + mask
+
+            return x_2d.view(x_size)
+
+    def forward(self, input, log_probs=True):
         """
         input == > Linear == > LogSoftmax
         """
-        return self.actn(self.proj(input))
+        logits = self.proj(input)
+
+        logits = self._pad_2d(logits)
+
+        if log_probs:
+            return F.log_softmax(logits, dim=-1)
+        else:
+            return F.softmax(logits, dim=-1)
+
 
 class Transformer(nn.Module):
     ''' A sequence to sequence model with attention mechanism. '''
 
     def __init__(
-            self, config, n_src_vocab, n_tgt_vocab, use_gpu=True):
+            self, config, src_vocab:Vocabulary, tgt_vocab:Vocabulary, use_gpu=True):
 
         super(Transformer, self).__init__()
 
+        n_src_vocab = src_vocab.max_n_words
+        n_tgt_vocab = tgt_vocab.max_n_words
+
+        self.src_vocab = src_vocab
+        self.tgt_vocab = tgt_vocab
+
+        self.src_pad = src_vocab.PAD
+        self.src_bos = src_vocab.BOS
+        self.src_eos = src_vocab.EOS
+        self.tgt_pad = tgt_vocab.PAD
+        self.tgt_bos = tgt_vocab.BOS
+        self.tgt_eos = tgt_vocab.EOS
+
         self.encoder = Encoder(
-            n_src_vocab, n_layers=config.num_layers, n_head=config.num_heads,
+            src_vocab, n_layers=config.num_layers, n_head=config.num_heads,
             d_word_vec=config.embed_size, d_model=config.embed_size,
             d_inner_hid=config.attention_size, dropout=config.dropout_hidden)
 
         self.decoder = Decoder(
-            n_tgt_vocab, n_layers=config.num_layers, n_head=config.num_heads,
+            tgt_vocab, n_layers=config.num_layers, n_head=config.num_heads,
             d_word_vec=config.embed_size, d_model=config.embed_size,
             d_inner_hid=config.attention_size, dropout=config.dropout_hidden)
 
         self.dropout = nn.Dropout(config.dropout_hidden)
 
         if config.proj_share_weight:
-            self.generator = Generator(n_words=n_tgt_vocab,
+            self.generator = Generator(vocab=self.tgt_vocab,
                                        hidden_size=config.embed_size,
-                                       shared_weight=self.decoder.embeddings.embeddings.weight,
-                                       padding_idx=NMTVocab.PAD)
+                                       shared_weight=self.decoder.embeddings.embeddings.weight)
 
         else:
-            self.generator = Generator(n_words=n_tgt_vocab, hidden_size=config.embed_size, padding_idx=NMTVocab.PAD)
+            self.generator = Generator(vocab=self.tgt_vocab, hidden_size=config.embed_size)
 
         self.use_gpu = use_gpu
 
@@ -308,9 +345,9 @@ class Transformer(nn.Module):
         enc_output, enc_mask = self.encoder(src_seq)
         dec_output, _, _ = self.decoder(tgt_seq, enc_output, enc_mask)
 
-        return dec_output
+        return self.generator(dec_output)
 
-    def batch_beam_search(self, src_seq, lengths, beam_size=5, max_steps=150):
+    def batch_beam_search(self, src_seq, lengths, beam_size=5, max_steps=150, alpha=-1.0):
 
         batch_size = src_seq.size(0)
 
@@ -322,10 +359,10 @@ class Transformer(nn.Module):
         enc_mask = tile_batch(enc_mask, multiplier=beam_size, batch_dim=0)
         enc_output = tile_batch(enc_output, multiplier=beam_size, batch_dim=0)
 
-        final_word_indices = src_seq.data.new(batch_size, beam_size, 1).fill_(NMTVocab.BOS) # Word indices in the beam
-        final_lengths = enc_output.data.new(batch_size, beam_size).fill_(0.0) # length of the sentence
-        beam_mask = enc_output.data.new(batch_size, beam_size).fill_(1.0) # Mask of beams
-        beam_scores = enc_output.data.new(batch_size, beam_size).fill_(0.0) # Accumulated scores of the beam
+        final_word_indices = src_seq.new(batch_size, beam_size, 1).fill_(self.tgt_bos) # Word indices in the beam
+        final_lengths = enc_output.new(batch_size, beam_size).fill_(0.0) # length of the sentence
+        beam_mask = enc_output.new(batch_size, beam_size).fill_(1.0) # Mask of beams
+        beam_scores = enc_output.new(batch_size, beam_size).fill_(0.0) # Accumulated scores of the beam
 
 
         self_attn_caches = None # Every element has shape [batch_size * beam_size, num_heads, seq_len, dim_head]
@@ -344,20 +381,32 @@ class Transformer(nn.Module):
 
             next_scores = - self.generator(dec_output[:,-1].contiguous()).data # [batch_size * beam_size, n_words]
             next_scores = next_scores.view(batch_size, beam_size, -1)
-            next_scores = mask_scores(next_scores, beam_mask=beam_mask)
+            next_scores = mask_scores(next_scores, beam_mask=beam_mask, eos_id=self.tgt_eos)
 
             beam_scores = next_scores + beam_scores.unsqueeze(2) # [B, Bm, N] + [B, Bm, 1] ==> [B, Bm, N]
 
             vocab_size = beam_scores.size(-1)
-            if t == 0:
-                beam_scores = beam_scores[:,0,:].contiguous()
+            if t == 0 and beam_size > 1:
+                # Force to select first beam at step 0
+                beam_scores[:, 1:, :] = float('inf')
 
+            # Length penalty
+            if alpha > 0.0:
+                normed_scores = beam_scores * (5.0 + 1.0) ** alpha / (5.0 + beam_mask + final_lengths).unsqueeze(2) ** alpha
+            else:
+                normed_scores = beam_scores.detach().clone()
+            # next_logits = -normed_scores
+            normed_scores = normed_scores.view(batch_size, -1)
+
+            # Get topK with beams
+            # indices: [batch_size, ]
+            _, indices = torch.topk(normed_scores, k=beam_size, dim=-1, largest=False, sorted=False)
+            next_beam_ids = torch.div(indices, vocab_size)  # [batch_size, ]
+            next_word_ids = indices % vocab_size  # [batch_size, ]
+
+            # Re-arrange by new beam indices
             beam_scores = beam_scores.view(batch_size, -1)
-
-            # Get topK with beams【
-            beam_scores, indices = torch.topk(beam_scores, k=beam_size, dim=-1, largest=False, sorted=False)
-            next_beam_ids = torch.div(indices, vocab_size)
-            next_word_ids = indices % vocab_size
+            beam_scores = torch.gather(beam_scores, 1, indices)
 
             # Re-arrange by new beam indices
             beam_mask = tensor_gather_helper(gather_indices=next_beam_ids,
@@ -391,8 +440,8 @@ class Transformer(nn.Module):
                                                 use_gpu=self.use_gpu), requires_grad=False), self_attn_caches)
 
             # If next_word_ids is EOS, beam_mask_ should be 0.0
-            beam_mask_ = 1.0 - next_word_ids.eq(NMTVocab.EOS).float()
-            next_word_ids.masked_fill_((beam_mask_ + beam_mask).eq(0.0), NMTVocab.PAD) # If last step a EOS is already generated, we replace the last token as PAD
+            beam_mask_ = 1.0 - next_word_ids.eq(self.tgt_eos).float()
+            next_word_ids.masked_fill_((beam_mask_ + beam_mask).eq(0.0), self.tgt_pad) # If last step a EOS is already generated, we replace the last token as PAD
             beam_mask = beam_mask * beam_mask_
 
             # # If an EOS or PAD is encountered, set the beam mask to 0.0
@@ -406,7 +455,12 @@ class Transformer(nn.Module):
             if beam_mask.eq(0.0).all():
                 break
 
-        scores = beam_scores / (final_lengths + 1e-2)
+        # Length penalty
+        if alpha > 0.0:
+            scores = beam_scores * (5.0 + 1.0) ** alpha / (5.0 + final_lengths) ** alpha
+        else:
+            scores = beam_scores / final_lengths
+
         _, reranked_ids = torch.sort(scores, dim=-1, descending=False)
 
         return tensor_gather_helper(gather_indices=reranked_ids,

@@ -199,10 +199,17 @@ class Configurable(object):
     def clip(self):
         return self._config.getfloat('Optimizer', 'clip')
 
+    @property
+    def schedule_method(self):
+        return self._config.get('Optimizer', 'schedule_method')
 
     @property
     def train_iters(self):
         return self._config.getint('Run', 'train_iters')
+
+    @property
+    def batching_key(self):
+        return self._config.get('Run', 'batching_key')
 
     @property
     def train_batch_size(self):

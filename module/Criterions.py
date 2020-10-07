@@ -1,61 +1,63 @@
 import torch
 import torch.nn as nn
-from torch.autograd import Variable
-from data.Vocab import NMTVocab
-
-class Critierion(nn.Module):
-    """
-    Class for managing efficient loss computation. Handles
-    sharding next step predictions and accumulating mutiple
-    loss computations
 
 
-    Users can implement their own loss computation strategy by making
-    subclass of this one.  Users need to implement the _compute_loss()
-    and make_shard_state() methods.
+class Criterion(nn.Module):
+    """ Class for managing loss computation.
 
-    Args:
-        generator (:obj:`nn.Module`) :
-             module that maps the output of the decoder to a
-             distribution over the target vocabulary.
-        tgt_vocab (:obj:`Vocab`) :
-             torchtext vocab object representing the target output
-        normalzation (str): normalize by "sents" or "tokens"
     """
 
-    def __init__(self):
-        super(Critierion, self).__init__()
-
-    def _compute_loss(self, generator, *args, **kwargs):
+    def _compute_loss(self, inputs, labels, **kwargs):
         """
-        Compute the loss. Subclass must define this method.
+        Compute the loss. Subclass must override this method.
 
         Args:
             output: the predict output from the model.
             target: the validate target to compare output with.
             **kwargs(optional): additional info for computing loss.
+        Returns:
+            A non-reduced FloatTensor with shape (batch, )
         """
         raise NotImplementedError
 
-    def forward(self, generator, normalization=1.0, **kwargs):
-        return self._compute_loss(generator, **kwargs).div(normalization)
+    def forward(self, inputs, labels, normalization=1.0, reduce=True, **kwargs):
+        """
+        Compute loss given inputs and labels.
+
+        Args:
+            inputs: Input tensor of the criterion.
+            labels: Label tensor of the criterion.
+            reduce: Boolean value indicate whether the criterion should reduce the loss along the batch. If false,
+                the criterion return a FloatTensor with shape (batch, ), otherwise a scalar.
+            normalization: Normalization factor of the loss. Should be a float scalar or a FloatTensor with shape
+                (batch, )
+        """
+        loss = self._compute_loss(inputs, labels, **kwargs).div(normalization)  # (batch, )
+
+        if reduce:
+            loss = loss.sum()
+
+        return loss
 
 
-class NMTCritierion(Critierion):
+class NMTCriterion(Criterion):
+    """ A common used criterion for neural machine translation
+
+    NMTCriterion is used for MLE training given golden target sample. Additional label_smoothing
+    is supported.
     """
-    TODO:
-    1. Add label smoothing
-    """
-    def __init__(self, padding_idx=NMTVocab.PAD, label_smoothing=0.0):
+
+    def __init__(self, padding_idx, label_smoothing=0.0):
 
         super().__init__()
+
         self.padding_idx = padding_idx
         self.label_smoothing = label_smoothing
 
         if label_smoothing > 0:
-            self.criterion = nn.KLDivLoss(size_average=False)
+            self.criterion = nn.KLDivLoss(reduction='none')
         else:
-            self.criterion = nn.NLLLoss(size_average=False, ignore_index=NMTVocab.PAD)
+            self.criterion = nn.NLLLoss(ignore_index=padding_idx, reduction='none')
 
         self.confidence = 1.0 - label_smoothing
 
@@ -77,31 +79,39 @@ class NMTCritierion(Critierion):
     def _bottle(self, v):
         return v.view(-1, v.size(2))
 
-    def _compute_loss(self, generator, dec_outs, labels):
+    def _compute_loss(self, inputs, labels, **kwargs):
 
-        scores = generator(self._bottle(dec_outs)) # [batch_size * seq_len, d_words]
+        """
+        Args:
+            inputs (..., K): Expect logarithm probabilities.
+            labels (...,): Index tensor. Should be the same size as inputs except the last dimension.
+        """
+
+        batch_size = labels.size(0)
+
+        scores = self._bottle(inputs)  # [batch_size * seq_len, d_words]
 
         num_tokens = scores.size(-1)
 
-        gtruth = labels.view(-1)
+        gtruth = labels.contiguous().view(-1)
 
         if self.confidence < 1:
-            tdata = gtruth.data
+            # N: the number of samples
+            # M: the number of labels
+            tdata = gtruth.detach()
 
-            mask = torch.nonzero(tdata.eq(self.padding_idx)).squeeze()
-            log_likelihood = torch.gather(scores.data, 1, tdata.unsqueeze(1))
+            mask = torch.nonzero(tdata.eq(self.padding_idx)).squeeze()  # mask of PAD
 
-            one_hot = self._smooth_label(num_tokens)
+            one_hot = self._smooth_label(num_tokens)  # Do label smoothing
             if labels.is_cuda:
                 one_hot = one_hot.cuda()
-
-            tmp_ = one_hot.repeat(gtruth.size(0), 1)
+            tmp_ = one_hot.repeat(gtruth.size(0), 1)  # [N, M]
             tmp_.scatter_(1, tdata.unsqueeze(1), self.confidence)
-            if mask.dim() > 0:
-                log_likelihood.index_fill_(0, mask, 0)
-                tmp_.index_fill_(0, mask, 0)
-            gtruth = Variable(tmp_, requires_grad=False)
 
-        loss = self.criterion(scores, gtruth)
+            if mask.numel() > 0:
+                tmp_.index_fill_(0, mask, 0)
+            gtruth = tmp_.detach()
+
+        loss = self.criterion(scores, gtruth).view((batch_size, -1)).sum(-1)
 
         return loss
